@@ -1,0 +1,170 @@
+//  build
+source /home/yang/Ascend/cann-9.1.0/cann-9.1.0/set_env.sh
+export ASCEND_CANN_PACKAGE_PATH=/home/yang/Ascend/cann-9.1.0/cann-9.1.0
+export BCAST_HOME=/home/yang/HCCL/hccl_broadcast_final_v1
+export HVM_HOME=/home/yang/HCCL/hccl_vm_workspace/hcomm/test/hccl_vm/hccl_vm_install
+cd "$BCAST_HOME"
+rm -rf build
+set -o pipefail
+bash build.sh 2>&1 | tee build_pass_baseline.log
+echo "编译退出码=${PIPESTATUS[0]}"
+
+sudo cp -f \
+"$BCAST_HOME/build/lib64/libhccl.so" \
+"$ASCEND_HOME_PATH/x86_64-linux/lib64/libhccl.so"
+
+
+
+
+///////////////////////
+sudo cp -f \
+"$BCAST_HOME/build/lib64/libhccl_device.so" \
+"$HVM_HOME/lib/aarch64/libhccl_device.so"
+///////////////////////
+
+
+
+// debug
+source /home/yang/Ascend/cann-9.1.0/cann-9.1.0/set_env.sh
+export ASCEND_CANN_PACKAGE_PATH=/home/yang/Ascend/cann-9.1.0/cann-9.1.0
+export BCAST_HOME=/home/yang/HCCL/hccl_broadcast_final_v1
+export HVM_HOME=/home/yang/HCCL/hccl_vm_workspace/hcomm/test/hccl_vm/hccl_vm_install
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+unset HCCL_ALGO 2>/dev/null || true
+export RANK_TABLE_FILE="$HVM_HOME/data/ranktable.json"
+export LD_LIBRARY_PATH="$ASCEND_HOME_PATH/x86_64-linux/lib64:$ASCEND_HOME_PATH/lib64:$ASCEND_HOME_PATH/devlib:$LD_LIBRARY_PATH"
+cd "$HVM_HOME/bin"
+
+./hccl-vm start \
+ascend950_cluster_32_server_normal.yaml \
+--check-only
+
+
+
+hccl-vm mock-comm 128 // topo1
+
+// 512kb
+mpirun --allow-run-as-root --oversubscribe -np 16 \
+"$ASCEND_HOME_PATH/tools/hccl_test/bin/broadcast_test" \
+-p 8 \
+-b 524288 \
+-e 524288 \
+-d fp32 \
+-r 0 \
+-w 0 \
+-n 1 \
+-c 1
+echo "broadcast退出码=$?"
+hccl-vm plugin run @checker
+
+// 512Mb
+mpirun --allow-run-as-root --oversubscribe -np 16 \
+"$ASCEND_HOME_PATH/tools/hccl_test/bin/broadcast_test" \
+-p 8 \
+-b 536870912 \
+-e 536870912 \
+-d fp32 \
+-r 0 \
+-w 0 \
+-n 1 \
+-c 1
+hccl-vm plugin run @checker
+
+// 400Mb+4b
+mpirun --allow-run-as-root --oversubscribe -np 16 \
+"$ASCEND_HOME_PATH/tools/hccl_test/bin/broadcast_test" \
+-p 8 \
+-b 419430404 \
+-e 419430404 \
+-d fp32 \
+-r 0 \
+-w 0 \
+-n 1 \
+-c 1
+
+hccl-vm plugin run @checker
+
+
+hccl-vm mock-comm 141 // topo2
+
+// 512kb
+mpirun --allow-run-as-root --oversubscribe -np 4 \
+"$ASCEND_HOME_PATH/tools/hccl_test/bin/broadcast_test" \
+-p 1 \
+-b 524288 \
+-e 524288 \
+-d fp32 \
+-r 0 \
+-w 0 \
+-n 1 \
+-c 1
+echo "broadcast退出码=$?"
+hccl-vm plugin run @checker
+
+// 512Mb
+mpirun --allow-run-as-root --oversubscribe -np 4 \
+"$ASCEND_HOME_PATH/tools/hccl_test/bin/broadcast_test" \
+-p 1 \
+-b 536870912 \
+-e 536870912 \
+-d fp32 \
+-r 0 \
+-w 0 \
+-n 1 \
+-c 1
+hccl-vm plugin run @checker
+
+// 400Mb+4b
+mpirun --allow-run-as-root --oversubscribe -np 4 \
+"$ASCEND_HOME_PATH/tools/hccl_test/bin/broadcast_test" \
+-p 1 \
+-b 419430404 \
+-e 419430404 \
+-d fp32 \
+-r 0 \
+-w 0 \
+-n 1 \
+-c 1
+
+hccl-vm plugin run @checker
+
+
+hccl-vm mock-comm 12_8_4 // topo3
+
+// 512kb
+mpirun --allow-run-as-root --oversubscribe -np 12 \
+"$ASCEND_HOME_PATH/tools/hccl_test/bin/broadcast_test" \
+-b 524288 \
+-e 524288 \
+-d fp32 \
+-r 0 \
+-w 0 \
+-n 1 \
+-c 1
+echo "broadcast退出码=$?"
+hccl-vm plugin run @checker
+
+// 512Mb
+mpirun --allow-run-as-root --oversubscribe -np 12 \
+"$ASCEND_HOME_PATH/tools/hccl_test/bin/broadcast_test" \
+-b 536870912 \
+-e 536870912 \
+-d fp32 \
+-r 0 \
+-w 0 \
+-n 1 \
+-c 1
+hccl-vm plugin run @checker
+
+// 400Mb+4b
+mpirun --allow-run-as-root --oversubscribe -np 12 \
+"$ASCEND_HOME_PATH/tools/hccl_test/bin/broadcast_test" \
+-b 419430404 \
+-e 419430404 \
+-d fp32 \
+-r 0 \
+-w 0 \
+-n 1 \
+-c 1
+
+hccl-vm plugin run @checker
