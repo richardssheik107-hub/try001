@@ -1,6 +1,8 @@
+#include <algorithm>
 #include <cstdint>
 
 #include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
 
 #include "../op_kernel/sparse_softmax_tiling.h"
 #include "../op_kernel/tiling_key_sparse_softmax.h"
@@ -54,8 +56,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         outerSize = totalLength / (dimSize * innerSize);
     }
 
-    const uint64_t indexLength = index == nullptr ? 0 : static_cast<uint64_t>(index->GetShapeSize());
-    const uint64_t ptrLength = ptr == nullptr ? 0 : static_cast<uint64_t>(ptr->GetShapeSize());
+    const uint64_t indexLength =
+        index == nullptr ? 0 : static_cast<uint64_t>(index->GetShapeSize());
+    const uint64_t ptrLength =
+        ptr == nullptr ? 0 : static_cast<uint64_t>(ptr->GetShapeSize());
 
     const uint32_t mode = ptr == nullptr ? 0U : 1U;
     if (mode == 0U && indexLength == 0U && totalLength != 0U) {
@@ -78,7 +82,54 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     }
     ASCENDC_TPL_SEL_PARAM(context, DT_MODE);
 
-    SparseSoftmaxTilingData *tiling = context->GetTilingData<SparseSoftmaxTilingData>();
+    const uint32_t dtypeSize =
+        static_cast<uint32_t>(ge::GetSizeByDataType(dtypeSrc));
+
+    // Generic runtime strategy:
+    //   2: CSR groups are independent and contiguous when innerSize == 1, so
+    //      schedule groups directly across cores and use DMA for every group.
+    //   1: Otherwise, stage a complete outer slab or a 2-D inner tile through
+    //      UB and write it back with DMA.  This covers arbitrary rank/dim.
+    //   0: Only when no safe DMA tile fits do we keep the scalar correctness
+    //      fallback.
+    uint32_t fastPath = 0U;
+    const uint64_t outerSlabElems = dimSize * innerSize;
+    const uint64_t outerSlabBytes = outerSlabElems * dtypeSize;
+    const bool wholeOuterFits =
+        outerSlabBytes <= SPARSE_SOFTMAX_RAW_BUFFER_BYTES;
+    const bool twoDTileFits =
+        dimSize > 0 &&
+        dimSize <= SPARSE_SOFTMAX_MAX_DMA_BLOCKS &&
+        dimSize * 32ULL <= SPARSE_SOFTMAX_RAW_BUFFER_BYTES;
+
+    if (mode == 1U && innerSize == 1U) {
+        fastPath = 2U;
+    } else if (wholeOuterFits || twoDTileFits) {
+        fastPath = 1U;
+    }
+
+    auto platform =
+        platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    int32_t coreNum = platform.GetCoreNumAiv();
+    if (coreNum <= 0) {
+        coreNum = 1;
+    }
+
+    uint64_t taskCount = 1;
+    if (fastPath == 2U) {
+        taskCount = outerSize * (ptrLength - 1U);
+    } else if (fastPath == 1U) {
+        taskCount = outerSize;
+    }
+    if (taskCount == 0) {
+        taskCount = 1;
+    }
+
+    const uint32_t blockDim = static_cast<uint32_t>(
+        std::min<uint64_t>(static_cast<uint64_t>(coreNum), taskCount));
+
+    SparseSoftmaxTilingData *tiling =
+        context->GetTilingData<SparseSoftmaxTilingData>();
     tiling->totalLength = totalLength;
     tiling->outerSize = outerSize;
     tiling->dimSize = dimSize;
@@ -86,9 +137,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     tiling->indexLength = indexLength;
     tiling->ptrLength = ptrLength;
     tiling->mode = mode;
+    tiling->fastPath = fastPath;
+    tiling->blockDim = blockDim;
+    tiling->dtypeSize = dtypeSize;
     tiling->eps = eps;
 
-    context->SetBlockDim(1);
+    context->SetBlockDim(blockDim);
 
     size_t *workspace = context->GetWorkspaceSizes(1);
     workspace[0] = 0;
