@@ -4,30 +4,49 @@
 #include "tiling_key_sparse_softmax.h"
 
 template <typename T>
-struct ScalarConvert {
-    __aicore__ static inline float ToFloatValue(T value) {
+struct StorageTraits {
+    using StorageType = T;
+
+    __aicore__ static inline float ToFloatValue(StorageType value) {
         return static_cast<float>(value);
     }
 
-    __aicore__ static inline T FromFloatValue(float value) {
-        return static_cast<T>(value);
+    __aicore__ static inline StorageType FromFloatValue(float value) {
+        return static_cast<StorageType>(value);
     }
 };
 
 template <>
-struct ScalarConvert<bfloat16_t> {
-    __aicore__ static inline float ToFloatValue(bfloat16_t value) {
-        return AscendC::ToFloat(value);
+struct StorageTraits<bfloat16_t> {
+    using StorageType = uint16_t;
+
+    __aicore__ static inline float ToFloatValue(StorageType value) {
+        union {
+            uint32_t u;
+            float f;
+        } bits;
+        bits.u = static_cast<uint32_t>(value) << 16;
+        return bits.f;
     }
 
-    __aicore__ static inline bfloat16_t FromFloatValue(float value) {
-        return AscendC::ToBfloat16(value);
+    __aicore__ static inline StorageType FromFloatValue(float value) {
+        union {
+            float f;
+            uint32_t u;
+        } bits;
+        bits.f = value;
+
+        const uint32_t lsb = (bits.u >> 16) & 1U;
+        const uint32_t rounded = bits.u + 0x7FFFU + lsb;
+        return static_cast<uint16_t>(rounded >> 16);
     }
 };
 
 template <typename T>
 class KernelSparseSoftmax {
 public:
+    using StorageType = typename StorageTraits<T>::StorageType;
+
     __aicore__ inline KernelSparseSoftmax() {}
 
     __aicore__ inline void Init(GM_ADDR src, GM_ADDR index, GM_ADDR ptr, GM_ADDR out,
@@ -35,8 +54,8 @@ public:
                                 uint64_t dimSize, uint64_t innerSize,
                                 uint64_t indexLength, uint64_t ptrLength,
                                 uint32_t mode, float eps) {
-        srcGlobal_.SetGlobalBuffer((__gm__ T *)src);
-        outGlobal_.SetGlobalBuffer((__gm__ T *)out);
+        srcGlobal_.SetGlobalBuffer((__gm__ StorageType *)src);
+        outGlobal_.SetGlobalBuffer((__gm__ StorageType *)out);
         if (index != nullptr) {
             indexGlobal_.SetGlobalBuffer((__gm__ int64_t *)index);
         }
@@ -53,8 +72,6 @@ public:
         mode_ = mode;
         eps_ = eps;
 
-        // Two 32-byte UB buffers are enough for a correctness-first scalar-to-
-        // vector Exp bridge. The optimized version will batch whole groups.
         pipe_.InitBuffer(expInputBuf_, 32);
         pipe_.InitBuffer(expOutputBuf_, 32);
     }
@@ -85,11 +102,11 @@ private:
     }
 
     __aicore__ inline float ReadSrc(uint64_t offset) const {
-        return ScalarConvert<T>::ToFloatValue(srcGlobal_.GetValue(offset));
+        return StorageTraits<T>::ToFloatValue(srcGlobal_.GetValue(offset));
     }
 
     __aicore__ inline void WriteOut(uint64_t offset, float value) {
-        outGlobal_.SetValue(offset, ScalarConvert<T>::FromFloatValue(value));
+        outGlobal_.SetValue(offset, StorageTraits<T>::FromFloatValue(value));
     }
 
     __aicore__ inline float ExpScalar(float value) {
@@ -220,10 +237,10 @@ private:
     AscendC::TPipe pipe_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> expInputBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> expOutputBuf_;
-    AscendC::GlobalTensor<T> srcGlobal_;
+    AscendC::GlobalTensor<StorageType> srcGlobal_;
     AscendC::GlobalTensor<int64_t> indexGlobal_;
     AscendC::GlobalTensor<int64_t> ptrGlobal_;
-    AscendC::GlobalTensor<T> outGlobal_;
+    AscendC::GlobalTensor<StorageType> outGlobal_;
 
     uint64_t totalLength_ = 0;
     uint64_t outerSize_ = 0;
