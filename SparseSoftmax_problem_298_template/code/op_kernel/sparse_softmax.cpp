@@ -2,6 +2,8 @@
 #include "sparse_softmax_tiling.h"
 #include "tiling_key_sparse_softmax.h"
 
+// The included validated base still owns the full ProcessIndex and ProcessPtr
+// grouping paths.  This wrapper only intercepts one broadcast-index hot path.
 // Keep the previously validated kernel as the base implementation.  Only
 // expose its internals to this translation unit so we can add one narrow,
 // semantics-preserving hot path without rewriting the stable 1700+ line
