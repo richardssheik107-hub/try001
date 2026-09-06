@@ -4,6 +4,28 @@
 #include "tiling_key_sparse_softmax.h"
 
 template <typename T>
+struct ScalarConvert {
+    __aicore__ static inline float ToFloatValue(T value) {
+        return static_cast<float>(value);
+    }
+
+    __aicore__ static inline T FromFloatValue(float value) {
+        return static_cast<T>(value);
+    }
+};
+
+template <>
+struct ScalarConvert<bfloat16_t> {
+    __aicore__ static inline float ToFloatValue(bfloat16_t value) {
+        return AscendC::ToFloat(value);
+    }
+
+    __aicore__ static inline bfloat16_t FromFloatValue(float value) {
+        return AscendC::ToBfloat16(value);
+    }
+};
+
+template <typename T>
 class KernelSparseSoftmax {
 public:
     __aicore__ inline KernelSparseSoftmax() {}
@@ -59,26 +81,21 @@ private:
         if (indexLength_ == totalLength_) {
             return indexGlobal_.GetValue(FlatOffset(outer, dim, inner));
         }
-        // PyG's common form is index.shape == [src.size(dim)], broadcast over
-        // all remaining dimensions.
         return indexGlobal_.GetValue(dim);
     }
 
     __aicore__ inline float ReadSrc(uint64_t offset) const {
-        return static_cast<float>(srcGlobal_.GetValue(offset));
+        return ScalarConvert<T>::ToFloatValue(srcGlobal_.GetValue(offset));
     }
 
     __aicore__ inline void WriteOut(uint64_t offset, float value) {
-        outGlobal_.SetValue(offset, static_cast<T>(value));
+        outGlobal_.SetValue(offset, ScalarConvert<T>::FromFloatValue(value));
     }
 
     __aicore__ inline float ExpScalar(float value) {
         AscendC::LocalTensor<float> in = expInputBuf_.Get<float>();
         AscendC::LocalTensor<float> out = expOutputBuf_.Get<float>();
 
-        // SetValue runs on the scalar pipeline while Exp runs on the vector
-        // pipeline. The competition CANN toolchain does not provide SyncFunc;
-        // use the supported hard-event synchronization primitives instead.
         in.SetValue(0, value);
         auto eventSToV = pipe_.FetchEventID(AscendC::HardEvent::S_V);
         AscendC::SetFlag<AscendC::HardEvent::S_V>(eventSToV);
@@ -95,8 +112,6 @@ private:
     __aicore__ inline void ProcessIndex() {
         for (uint64_t outer = 0; outer < outerSize_; ++outer) {
             for (uint64_t inner = 0; inner < innerSize_; ++inner) {
-                // Discover each group once by its first occurrence. This keeps
-                // Exp O(dimSize) while tolerating unsorted/arbitrary indices.
                 for (uint64_t dim = 0; dim < dimSize_; ++dim) {
                     const int64_t group = ReadIndex(outer, dim, inner);
 
@@ -170,7 +185,7 @@ private:
                         endRaw = static_cast<int64_t>(dimSize_);
                     }
                     if (endRaw <= startRaw) {
-                        continue;  // valid empty CSR group
+                        continue;
                     }
 
                     const uint64_t start = static_cast<uint64_t>(startRaw);
