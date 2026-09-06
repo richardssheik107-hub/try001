@@ -1,0 +1,26 @@
+name: reference-ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feat/sparse-softmax-baseline
+
+jobs:
+  reference-semantics:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run dependency-free reference checks
+        run: python3 ci/reference_semantics.py
+      - name: Check submission source files exist
+        run: |
+          test -f SparseSoftmax_problem_298_template/code/op_host/sparse_softmax.cpp
+          test -f SparseSoftmax_problem_298_template/code/op_kernel/sparse_softmax.cpp
+          test -f SparseSoftmax_problem_298_template/code/op_kernel/sparse_softmax_tiling.h
+          test -f SparseSoftmax_problem_298_template/code/op_kernel/tiling_key_sparse_softmax.h
+      - name: Check both grouping paths are present
+        run: |
+          grep -q "ProcessIndex" SparseSoftmax_problem_298_template/code/op_kernel/sparse_softmax.cpp
+          grep -q "ProcessPtr" SparseSoftmax_problem_298_template/code/op_kernel/sparse_softmax.cpp

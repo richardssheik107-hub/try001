@@ -1,86 +1,137 @@
-// Host侧Tiling实现
+#include <cstdint>
+
 #include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
 
 #include "../op_kernel/sparse_softmax_tiling.h"
 #include "../op_kernel/tiling_key_sparse_softmax.h"
 
 namespace optiling {
-    static ge::graphStatus TilingFunc(gert::TilingContext *context) {
-        // 示例: 获取平台信息
-        auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-        int32_t num_cores_aiv = platform.GetCoreNumAiv();
-        uint64_t ub_size;
-        platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub_size);
-        // 示例: 获取算子输入数组信息
-        const gert::Tensor *tensor_src = context->GetRequiredInputTensor(0);
-        const gert::Tensor *tensor_index = context->GetOptionalInputTensor(1);
-        if(tensor_index) {
-            // 可选输入数组存在
-        }
-        const gert::Tensor *tensor_ptr = context->GetOptionalInputTensor(2);
-        if(tensor_ptr) {
-            // 可选输入数组存在
-        }
-        ge::DataType dtype_src = tensor_src->GetDataType(); // 获取数据类型
-        int dtype_size_src = ge::GetSizeByDataType(dtype_src); // 获取数据类型的字长
-        uint32_t length_src = tensor_src->GetShapeSize(); // 获取元素个数
-        uint32_t size_src = tensor_src->GetSize(); // 获取内存大小
-        // 示例: 获取算子输入属性
-        const gert::RuntimeAttrs *attrs = context->GetAttrs();
-        const int64_t *attr_dim = attrs->GetInt(0);
-        const float *attr_eps = attrs->GetFloat(1);
-        // 示例: 配置tiling key, 从而实现kernel侧不同数据类型/算法的区分
-        uint32_t DT_SRC = static_cast<uint32_t>(dtype_src);
-        ASCENDC_TPL_SEL_PARAM(context, DT_SRC);
-        // 示例: 计算tiling方案并填充tiling结构体
-        SparseSoftmaxTilingData *tiling = context->GetTilingData<SparseSoftmaxTilingData>();
-        tiling->length = length_src;
-        // 配置启动核数
-        context->SetBlockDim(num_cores_aiv);
-        // 配置workspace大小
-        size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-        currentWorkspace[0] = 0;
-        return ge::GRAPH_SUCCESS;
+static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+    const gert::Tensor *src = context->GetRequiredInputTensor(0);
+    const gert::Tensor *index = context->GetOptionalInputTensor(1);
+    const gert::Tensor *ptr = context->GetOptionalInputTensor(2);
+    if (src == nullptr || (index == nullptr && ptr == nullptr)) {
+        return ge::GRAPH_FAILED;
     }
+
+    auto shape = src->GetOriginShape();
+    const int64_t rank = static_cast<int64_t>(shape.GetDimNum());
+    if (rank <= 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    int64_t dim = 0;
+    float eps = 1e-16f;
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        const int64_t *attrDim = attrs->GetInt(0);
+        const float *attrEps = attrs->GetFloat(1);
+        if (attrDim != nullptr) {
+            dim = *attrDim;
+        }
+        if (attrEps != nullptr) {
+            eps = *attrEps;
+        }
+    }
+
+    if (dim < 0) {
+        dim += rank;
+    }
+    if (dim < 0 || dim >= rank) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint64_t totalLength = static_cast<uint64_t>(shape.GetShapeSize());
+    const uint64_t dimSize = static_cast<uint64_t>(shape.GetDim(dim));
+
+    uint64_t innerSize = 1;
+    for (int64_t i = dim + 1; i < rank; ++i) {
+        innerSize *= static_cast<uint64_t>(shape.GetDim(i));
+    }
+
+    uint64_t outerSize = 0;
+    if (dimSize != 0 && innerSize != 0) {
+        outerSize = totalLength / (dimSize * innerSize);
+    }
+
+    const uint64_t indexLength = index == nullptr ? 0 : static_cast<uint64_t>(index->GetShapeSize());
+    const uint64_t ptrLength = ptr == nullptr ? 0 : static_cast<uint64_t>(ptr->GetShapeSize());
+
+    // Match PyG precedence: if ptr is supplied, use the CSR/segment path.
+    const uint32_t mode = ptr == nullptr ? 0U : 1U;
+    if (mode == 0U && indexLength == 0U && totalLength != 0U) {
+        return ge::GRAPH_FAILED;
+    }
+    if (mode == 1U && ptrLength < 2U && dimSize != 0U) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const ge::DataType dtypeSrc = src->GetDataType();
+    const uint32_t DT_SRC = static_cast<uint32_t>(dtypeSrc);
+    ASCENDC_TPL_SEL_PARAM(context, DT_SRC);
+
+    SparseSoftmaxTilingData *tiling = context->GetTilingData<SparseSoftmaxTilingData>();
+    tiling->totalLength = totalLength;
+    tiling->outerSize = outerSize;
+    tiling->dimSize = dimSize;
+    tiling->innerSize = innerSize;
+    tiling->indexLength = indexLength;
+    tiling->ptrLength = ptrLength;
+    tiling->mode = mode;
+    tiling->eps = eps;
+
+    // First milestone is correctness.  A single core avoids cross-core races in
+    // arbitrary index groups; later versions can split by independent slices.
+    context->SetBlockDim(1);
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
 }  // namespace optiling
 
 namespace ge {
-    static graphStatus InferShape(gert::InferShapeContext *context) {
-        return GRAPH_SUCCESS;
+static graphStatus InferShape(gert::InferShapeContext *context) {
+    const gert::Shape *srcShape = context->GetInputShape(0);
+    gert::Shape *outShape = context->GetOutputShape(0);
+    if (srcShape == nullptr || outShape == nullptr) {
+        return GRAPH_FAILED;
     }
-    static graphStatus InferDataType(gert::InferDataTypeContext *context) {
-        return ge::GRAPH_SUCCESS;
-    }
+    *outShape = *srcShape;
+    return GRAPH_SUCCESS;
+}
+
+static graphStatus InferDataType(gert::InferDataTypeContext *context) {
+    context->SetOutputDataType(0, context->GetInputDataType(0));
+    return GRAPH_SUCCESS;
+}
 }  // namespace ge
 
 namespace ops {
-    class SparseSoftmax : public OpDef {
-    public:
-        explicit SparseSoftmax(const char *name) : OpDef(name) {
-            this->Input("src")
-                .ParamType(REQUIRED)
-                .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
-                .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-            this->Input("index")
-                .ParamType(OPTIONAL)
-                .DataType({ge::DT_INT32, ge::DT_INT32})
-                .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-            this->Input("ptr")
-                .ParamType(OPTIONAL)
-                .DataType({ge::DT_INT32, ge::DT_INT32})
-                .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-            this->Output("out")
-                .ParamType(REQUIRED)
-                .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
-                .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-            this->Attr("dim").AttrType(OPTIONAL).Int();
-            this->Attr("eps").AttrType(OPTIONAL).Float(1e-16);
-            this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-            this->AICore()
-                .SetTiling(optiling::TilingFunc)
-                .AddConfig("ascend910b");
-        }
-    };
-    OP_ADD(SparseSoftmax);
+class SparseSoftmax : public OpDef {
+public:
+    explicit SparseSoftmax(const char *name) : OpDef(name) {
+        this->Input("src")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Input("index")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_INT64, ge::DT_INT64, ge::DT_INT64})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Input("ptr")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_INT64, ge::DT_INT64, ge::DT_INT64})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Attr("dim").AttrType(OPTIONAL).Int(0);
+        this->Attr("eps").AttrType(OPTIONAL).Float(1e-16);
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc).AddConfig("ascend910b");
+    }
+};
+OP_ADD(SparseSoftmax);
 }  // namespace ops
