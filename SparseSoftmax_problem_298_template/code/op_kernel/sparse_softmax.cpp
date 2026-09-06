@@ -384,7 +384,7 @@ private:
             outQueue_.EnQue(outLocal);
             outLocal = outQueue_.DeQue<StorageType>();
             AscendC::DataCopyExtParams params = {
-                1, n * sizeof(StorageType), 0, 0, 0};
+                1, static_cast<uint32_t>(n * sizeof(StorageType)), 0, 0, 0};
             AscendC::DataCopyPad(outGlobal_[gmOffset + start], outLocal, params);
             outQueue_.FreeTensor(outLocal);
             start += n;
@@ -549,7 +549,7 @@ private:
             const uint32_t runLength = static_cast<uint32_t>(pos - runBegin);
             const uint32_t slotElement = slotBytes / sizeof(StorageType);
             AscendC::DataCopyExtParams params = {
-                1, runLength * sizeof(StorageType), 0, 0, 0};
+                1, static_cast<uint32_t>(runLength * sizeof(StorageType)), 0, 0, 0};
             AscendC::DataCopyPad(
                 outGlobal_[base + runBegin], outLocal[slotElement], params);
             slotBytes += static_cast<uint32_t>(
