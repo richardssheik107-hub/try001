@@ -57,7 +57,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     const uint64_t indexLength = index == nullptr ? 0 : static_cast<uint64_t>(index->GetShapeSize());
     const uint64_t ptrLength = ptr == nullptr ? 0 : static_cast<uint64_t>(ptr->GetShapeSize());
 
-    // Match PyG precedence: if ptr is supplied, use the CSR/segment path.
     const uint32_t mode = ptr == nullptr ? 0U : 1U;
     if (mode == 0U && indexLength == 0U && totalLength != 0U) {
         return ge::GRAPH_FAILED;
@@ -66,9 +65,18 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         return ge::GRAPH_FAILED;
     }
 
+    uint32_t DT_MODE = SPARSE_SOFTMAX_FP32;
     const ge::DataType dtypeSrc = src->GetDataType();
-    const uint32_t DT_SRC = static_cast<uint32_t>(dtypeSrc);
-    ASCENDC_TPL_SEL_PARAM(context, DT_SRC);
+    if (dtypeSrc == ge::DT_FLOAT) {
+        DT_MODE = SPARSE_SOFTMAX_FP32;
+    } else if (dtypeSrc == ge::DT_FLOAT16) {
+        DT_MODE = SPARSE_SOFTMAX_FP16;
+    } else if (dtypeSrc == ge::DT_BF16) {
+        DT_MODE = SPARSE_SOFTMAX_BF16;
+    } else {
+        return ge::GRAPH_FAILED;
+    }
+    ASCENDC_TPL_SEL_PARAM(context, DT_MODE);
 
     SparseSoftmaxTilingData *tiling = context->GetTilingData<SparseSoftmaxTilingData>();
     tiling->totalLength = totalLength;
@@ -80,8 +88,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     tiling->mode = mode;
     tiling->eps = eps;
 
-    // First milestone is correctness.  A single core avoids cross-core races in
-    // arbitrary index groups; later versions can split by independent slices.
     context->SetBlockDim(1);
 
     size_t *workspace = context->GetWorkspaceSizes(1);
