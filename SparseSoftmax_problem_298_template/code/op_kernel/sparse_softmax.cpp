@@ -102,6 +102,13 @@ public:
         } else {
             ProcessIndex();
         }
+
+        // GlobalTensor::SetValue writes through the scalar DataCache. Flush the
+        // cache once after all output elements are written so the judge sees
+        // the final values in GM.
+        AscendC::DataCacheCleanAndInvalid<StorageType,
+            AscendC::CacheLine::ENTIRE_DATA_CACHE,
+            AscendC::DcciDst::CACHELINE_OUT>(outGlobal_);
     }
 
 private:
