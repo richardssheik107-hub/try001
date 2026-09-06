@@ -30,8 +30,6 @@ struct StorageTraits<SPARSE_SOFTMAX_FP16> {
 
 template <>
 struct StorageTraits<SPARSE_SOFTMAX_BF16> {
-    // Keep BF16 out of the scalar backend.  The judge's CANN 8.5 backend
-    // rejects BF16 scalar casts, so BF16 is stored as raw 16-bit payloads.
     using StorageType = uint16_t;
 
     __aicore__ static inline float ToFloatValue(StorageType value) {
@@ -65,6 +63,7 @@ public:
         SPARSE_SOFTMAX_WORK_BUFFER_ELEMS;
     static constexpr uint32_t INDEX_ELEMS =
         SPARSE_SOFTMAX_INDEX_BUFFER_BYTES / sizeof(int32_t);
+    static constexpr uint32_t LANE_BATCH_MAX = 8;
     static constexpr float NEG_FLOAT_MAX = -3.402823466e+38F;
 
     __aicore__ inline KernelSparseSoftmax() {}
@@ -95,14 +94,10 @@ public:
         eps_ = tiling.eps;
         singletonValue_ = 1.0F / (1.0F + eps_);
 
-        // One 4 KiB float work buffer is enough for the hot paths.  Unlike the
-        // previous implementation we do not reserve raw/value/exp/index
-        // buffers unconditionally on every AIV.
         pipe_.InitBuffer(
             workBuf_, SPARSE_SOFTMAX_WORK_BUFFER_ELEMS * sizeof(float));
 
         if (fastPath_ == 3U) {
-            // Group-owner axis path: only computation + aligned VECOUT slots.
             pipe_.InitBuffer(
                 outQueue_, 1, SPARSE_SOFTMAX_AXIS_OUT_QUEUE_BYTES);
             return;
@@ -251,38 +246,47 @@ private:
 
     __aicore__ inline float SumWork(
         AscendC::LocalTensor<float> work, uint32_t count) const {
+        return SumWorkRange(work, 0, count);
+    }
+
+    __aicore__ inline float SumWorkRange(
+        AscendC::LocalTensor<float> work,
+        uint32_t offset, uint32_t count) const {
         float s0 = 0.0F;
         float s1 = 0.0F;
         float s2 = 0.0F;
         float s3 = 0.0F;
         uint32_t i = 0;
         for (; i + 3U < count; i += 4U) {
-            s0 += work.GetValue(i);
-            s1 += work.GetValue(i + 1U);
-            s2 += work.GetValue(i + 2U);
-            s3 += work.GetValue(i + 3U);
+            s0 += work.GetValue(offset + i);
+            s1 += work.GetValue(offset + i + 1U);
+            s2 += work.GetValue(offset + i + 2U);
+            s3 += work.GetValue(offset + i + 3U);
         }
         float sum = (s0 + s1) + (s2 + s3);
         for (; i < count; ++i) {
-            sum += work.GetValue(i);
+            sum += work.GetValue(offset + i);
         }
         return sum;
     }
 
-    __aicore__ inline float ExpAndSumWork(uint32_t count) {
+    __aicore__ inline void ExpWorkOnly(uint32_t count) {
         AscendC::LocalTensor<float> work = workBuf_.Get<float>();
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::Exp(work, work, static_cast<int32_t>(count));
         AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline float ExpAndSumWork(uint32_t count) {
+        AscendC::LocalTensor<float> work = workBuf_.Get<float>();
+        ExpWorkOnly(count);
         return SumWork(work, count);
     }
 
     __aicore__ inline void ExpAndScaleWork(
         uint32_t count, float inverse) {
         AscendC::LocalTensor<float> work = workBuf_.Get<float>();
-        AscendC::PipeBarrier<PIPE_ALL>();
-        AscendC::Exp(work, work, static_cast<int32_t>(count));
-        AscendC::PipeBarrier<PIPE_V>();
+        ExpWorkOnly(count);
         AscendC::Muls(
             work, work, inverse, static_cast<int32_t>(count));
         AscendC::PipeBarrier<PIPE_V>();
@@ -290,9 +294,7 @@ private:
 
     __aicore__ inline float ExpNormalizeWork(uint32_t count) {
         AscendC::LocalTensor<float> work = workBuf_.Get<float>();
-        AscendC::PipeBarrier<PIPE_ALL>();
-        AscendC::Exp(work, work, static_cast<int32_t>(count));
-        AscendC::PipeBarrier<PIPE_V>();
+        ExpWorkOnly(count);
         const float inverse = 1.0F / (SumWork(work, count) + eps_);
         AscendC::Muls(
             work, work, inverse, static_cast<int32_t>(count));
@@ -302,9 +304,6 @@ private:
 
     // ---------------------------------------------------------------------
     // Fast path 3: index + contiguous axis (inner == 1).
-    // Work is assigned by first-occurrence seed, so labels need not be dense.
-    // Each group owns its output and writes contiguous runs through MTE3 from
-    // 32-byte-aligned VECOUT slots, avoiding cross-AIV DCache ownership.
     // ---------------------------------------------------------------------
 
     __aicore__ inline int32_t ReadAxisIndex(
@@ -617,8 +616,7 @@ private:
     }
 
     // ---------------------------------------------------------------------
-    // Fast path 2: ptr + contiguous axis.  Each (outer, group) is independent
-    // and can be scheduled directly across AIVs.
+    // Fast path 2: ptr + contiguous axis.
     // ---------------------------------------------------------------------
 
     __aicore__ inline int64_t ReadPtrValue(
@@ -676,6 +674,21 @@ private:
             }
         }
 
+        // Common small/medium groups fit the work buffer.  Keep the first Exp
+        // result and normalize while writing raw, instead of recomputing Exp.
+        if (count <= WORK_ELEMS) {
+            const uint32_t n = static_cast<uint32_t>(count);
+            for (uint32_t i = 0; i < n; ++i) {
+                work.SetValue(i, ReadRaw(raw, i) - maxValue);
+            }
+            const float sum = ExpAndSumWork(n);
+            const float inverse = 1.0F / (sum + eps_);
+            for (uint32_t i = 0; i < n; ++i) {
+                WriteRaw(raw, i, work.GetValue(i) * inverse);
+            }
+            return;
+        }
+
         float groupSum = 0.0F;
         uint64_t start = 0;
         while (start < count) {
@@ -700,9 +713,9 @@ private:
                 work.SetValue(
                     i, ReadRaw(raw, start + i) - maxValue);
             }
-            ExpAndScaleWork(n, inverse);
+            ExpWorkOnly(n);
             for (uint32_t i = 0; i < n; ++i) {
-                WriteRaw(raw, start + i, work.GetValue(i));
+                WriteRaw(raw, start + i, work.GetValue(i) * inverse);
             }
             start += n;
         }
@@ -750,7 +763,6 @@ private:
             return;
         }
 
-        // Large-group fallback: three streaming passes over GM.
         float maxValue = NEG_FLOAT_MAX;
         uint64_t chunkStart = 0;
         while (chunkStart < count) {
@@ -831,10 +843,11 @@ private:
                     work.SetValue(
                         i, ReadRaw(raw, localStart + i) - maxValue);
                 }
-                ExpAndScaleWork(n, inverse);
+                ExpWorkOnly(n);
                 for (uint32_t i = 0; i < n; ++i) {
                     WriteRaw(
-                        raw, localStart + i, work.GetValue(i));
+                        raw, localStart + i,
+                        work.GetValue(i) * inverse);
                 }
                 localStart += n;
             }
@@ -885,9 +898,9 @@ private:
     }
 
     // ---------------------------------------------------------------------
-    // Fast path 1: arbitrary-rank tiled DMA.  Work ownership is
-    // (outer, inner-tile), not just outer, so shapes with outer==1 can still
-    // use multiple AIVs.  Every tile is written back by exactly one AIV.
+    // Fast path 1: arbitrary-rank tiled DMA.
+    // Broadcast index and ptr share group membership across inner lanes, so
+    // lanes are batched into one vector Exp to amortize fixed vector barriers.
     // ---------------------------------------------------------------------
 
     __aicore__ inline bool LoadBroadcastIndex(
@@ -948,21 +961,20 @@ private:
             }
         }
 
-        // Tiled-DMA fast path has dimSize <= RAW_BYTES/32 <= 256, so one
-        // work buffer always holds a complete group.
         uint32_t packed = 0;
         for (uint64_t pos = start; pos < end; ++pos) {
             work.SetValue(
                 packed++,
                 ReadRaw(raw, pos * rowStride + lane) - maxValue);
         }
-        ExpNormalizeWork(packed);
+        const float sum = ExpAndSumWork(packed);
+        const float inverse = 1.0F / (sum + eps_);
 
         packed = 0;
         for (uint64_t pos = start; pos < end; ++pos) {
             WriteRaw(
                 raw, pos * rowStride + lane,
-                work.GetValue(packed++));
+                work.GetValue(packed++) * inverse);
         }
     }
 
@@ -1017,7 +1029,8 @@ private:
                     maxValue);
             }
         }
-        ExpNormalizeWork(packed);
+        const float sum = ExpAndSumWork(packed);
+        const float inverse = 1.0F / (sum + eps_);
 
         packed = 0;
         for (uint64_t pos = 0; pos < dimSize_; ++pos) {
@@ -1027,7 +1040,7 @@ private:
                     globalInner, localInner) == group) {
                 WriteRaw(
                     raw, pos * rowStride + localInner,
-                    work.GetValue(packed++));
+                    work.GetValue(packed++) * inverse);
             }
         }
     }
@@ -1050,6 +1063,191 @@ private:
         return true;
     }
 
+    __aicore__ inline uint32_t CountBroadcastGroup(
+        AscendC::LocalTensor<int32_t> cachedIndex,
+        bool localIndex, uint64_t outer,
+        uint64_t innerStart, int32_t group,
+        uint64_t &singletonPos) const {
+        uint32_t count = 0;
+        singletonPos = 0;
+        for (uint64_t pos = 0; pos < dimSize_; ++pos) {
+            if (IndexAtTile(
+                    cachedIndex, localIndex, true, 0,
+                    outer, pos, innerStart, 0) == group) {
+                singletonPos = pos;
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    __aicore__ inline uint32_t ChooseLaneBatch(
+        uint64_t remainingLanes, uint32_t groupCount) const {
+        if (groupCount == 0) {
+            return 1;
+        }
+        uint32_t byWork = WORK_ELEMS / groupCount;
+        if (byWork == 0) {
+            byWork = 1;
+        }
+        uint32_t batch = static_cast<uint32_t>(
+            remainingLanes > LANE_BATCH_MAX ?
+            LANE_BATCH_MAX : remainingLanes);
+        if (batch > byWork) {
+            batch = byWork;
+        }
+        return batch == 0 ? 1 : batch;
+    }
+
+    __aicore__ inline void SoftmaxBroadcastGroupBatch(
+        AscendC::LocalTensor<StorageType> raw,
+        AscendC::LocalTensor<int32_t> cachedIndex,
+        bool localIndex, uint64_t rowStride,
+        uint64_t outer, uint64_t innerStart,
+        uint64_t laneStart, uint32_t laneCount,
+        int32_t group, uint32_t groupCount,
+        uint64_t singletonPos) {
+        if (groupCount == 0) {
+            return;
+        }
+        if (groupCount == 1) {
+            for (uint32_t lane = 0; lane < laneCount; ++lane) {
+                WriteRaw(
+                    raw,
+                    singletonPos * rowStride + laneStart + lane,
+                    singletonValue_);
+            }
+            return;
+        }
+
+        float maxValues[LANE_BATCH_MAX];
+        float inverseValues[LANE_BATCH_MAX];
+        for (uint32_t lane = 0; lane < laneCount; ++lane) {
+            maxValues[lane] = NEG_FLOAT_MAX;
+        }
+
+        for (uint64_t pos = 0; pos < dimSize_; ++pos) {
+            if (IndexAtTile(
+                    cachedIndex, localIndex, true, 0,
+                    outer, pos, innerStart, 0) != group) {
+                continue;
+            }
+            const uint64_t rowBase = pos * rowStride + laneStart;
+            for (uint32_t lane = 0; lane < laneCount; ++lane) {
+                const float value = ReadRaw(raw, rowBase + lane);
+                if (value > maxValues[lane]) {
+                    maxValues[lane] = value;
+                }
+            }
+        }
+
+        AscendC::LocalTensor<float> work = workBuf_.Get<float>();
+        uint32_t packed = 0;
+        for (uint64_t pos = 0; pos < dimSize_; ++pos) {
+            if (IndexAtTile(
+                    cachedIndex, localIndex, true, 0,
+                    outer, pos, innerStart, 0) != group) {
+                continue;
+            }
+            const uint64_t rowBase = pos * rowStride + laneStart;
+            for (uint32_t lane = 0; lane < laneCount; ++lane) {
+                work.SetValue(
+                    lane * groupCount + packed,
+                    ReadRaw(raw, rowBase + lane) - maxValues[lane]);
+            }
+            ++packed;
+        }
+
+        ExpWorkOnly(laneCount * groupCount);
+        for (uint32_t lane = 0; lane < laneCount; ++lane) {
+            const float sum = SumWorkRange(
+                work, lane * groupCount, groupCount);
+            inverseValues[lane] = 1.0F / (sum + eps_);
+        }
+
+        packed = 0;
+        for (uint64_t pos = 0; pos < dimSize_; ++pos) {
+            if (IndexAtTile(
+                    cachedIndex, localIndex, true, 0,
+                    outer, pos, innerStart, 0) != group) {
+                continue;
+            }
+            const uint64_t rowBase = pos * rowStride + laneStart;
+            for (uint32_t lane = 0; lane < laneCount; ++lane) {
+                WriteRaw(
+                    raw, rowBase + lane,
+                    work.GetValue(lane * groupCount + packed) *
+                    inverseValues[lane]);
+            }
+            ++packed;
+        }
+    }
+
+    __aicore__ inline void SoftmaxContiguousBatch(
+        AscendC::LocalTensor<StorageType> raw,
+        uint64_t rowStride, uint64_t laneStart,
+        uint32_t laneCount, uint64_t start, uint64_t end) {
+        const uint32_t groupCount =
+            static_cast<uint32_t>(end - start);
+        if (groupCount == 0) {
+            return;
+        }
+        if (groupCount == 1) {
+            for (uint32_t lane = 0; lane < laneCount; ++lane) {
+                WriteRaw(
+                    raw, start * rowStride + laneStart + lane,
+                    singletonValue_);
+            }
+            return;
+        }
+
+        float maxValues[LANE_BATCH_MAX];
+        float inverseValues[LANE_BATCH_MAX];
+        for (uint32_t lane = 0; lane < laneCount; ++lane) {
+            maxValues[lane] = NEG_FLOAT_MAX;
+        }
+
+        for (uint64_t pos = start; pos < end; ++pos) {
+            const uint64_t rowBase = pos * rowStride + laneStart;
+            for (uint32_t lane = 0; lane < laneCount; ++lane) {
+                const float value = ReadRaw(raw, rowBase + lane);
+                if (value > maxValues[lane]) {
+                    maxValues[lane] = value;
+                }
+            }
+        }
+
+        AscendC::LocalTensor<float> work = workBuf_.Get<float>();
+        for (uint32_t lane = 0; lane < laneCount; ++lane) {
+            for (uint32_t i = 0; i < groupCount; ++i) {
+                work.SetValue(
+                    lane * groupCount + i,
+                    ReadRaw(
+                        raw,
+                        (start + i) * rowStride + laneStart + lane) -
+                    maxValues[lane]);
+            }
+        }
+
+        ExpWorkOnly(laneCount * groupCount);
+        for (uint32_t lane = 0; lane < laneCount; ++lane) {
+            const float sum = SumWorkRange(
+                work, lane * groupCount, groupCount);
+            inverseValues[lane] = 1.0F / (sum + eps_);
+        }
+
+        for (uint32_t i = 0; i < groupCount; ++i) {
+            const uint64_t rowBase =
+                (start + i) * rowStride + laneStart;
+            for (uint32_t lane = 0; lane < laneCount; ++lane) {
+                WriteRaw(
+                    raw, rowBase + lane,
+                    work.GetValue(lane * groupCount + i) *
+                    inverseValues[lane]);
+            }
+        }
+    }
+
     __aicore__ inline void ProcessBroadcastIndexTile(
         AscendC::LocalTensor<StorageType> raw,
         AscendC::LocalTensor<int32_t> cachedIndex,
@@ -1066,11 +1264,21 @@ private:
                 continue;
             }
 
-            for (uint64_t lane = 0; lane < tileWidth; ++lane) {
-                SoftmaxLocalIndexGroup(
-                    raw, cachedIndex, localIndex, true,
-                    rowStride, 0, outer,
-                    innerStart + lane, lane, group);
+            uint64_t singletonPos = 0;
+            const uint32_t groupCount = CountBroadcastGroup(
+                cachedIndex, localIndex, outer,
+                innerStart, group, singletonPos);
+
+            uint64_t laneStart = 0;
+            while (laneStart < tileWidth) {
+                const uint32_t laneBatch = ChooseLaneBatch(
+                    tileWidth - laneStart, groupCount);
+                SoftmaxBroadcastGroupBatch(
+                    raw, cachedIndex, localIndex,
+                    rowStride, outer, innerStart,
+                    laneStart, laneBatch, group,
+                    groupCount, singletonPos);
+                laneStart += laneBatch;
             }
         }
     }
@@ -1108,11 +1316,11 @@ private:
         AscendC::LocalTensor<int32_t> cachedPtr,
         bool ptrCached, uint64_t rowStride,
         uint64_t tileWidth) {
-        const uint64_t groupCount = ptrLength_ - 1U;
+        const uint64_t groupCountAll = ptrLength_ - 1U;
         int64_t startRaw =
             ReadPtrValue(cachedPtr, ptrCached, 0);
 
-        for (uint64_t group = 0; group < groupCount; ++group) {
+        for (uint64_t group = 0; group < groupCountAll; ++group) {
             int64_t endRaw =
                 ReadPtrValue(cachedPtr, ptrCached, group + 1U);
             int64_t start = startRaw;
@@ -1123,11 +1331,16 @@ private:
                 continue;
             }
 
-            for (uint64_t lane = 0; lane < tileWidth; ++lane) {
-                SoftmaxLocalContiguous(
-                    raw, rowStride, lane,
+            const uint32_t groupCount = static_cast<uint32_t>(end - start);
+            uint64_t laneStart = 0;
+            while (laneStart < tileWidth) {
+                const uint32_t laneBatch = ChooseLaneBatch(
+                    tileWidth - laneStart, groupCount);
+                SoftmaxContiguousBatch(
+                    raw, rowStride, laneStart, laneBatch,
                     static_cast<uint64_t>(start),
                     static_cast<uint64_t>(end));
+                laneStart += laneBatch;
             }
         }
     }
@@ -1355,14 +1568,14 @@ private:
                 continue;
             }
 
-            ExpAndScaleWork(packed, inverse);
+            ExpWorkOnly(packed);
             uint32_t outputPos = 0;
             for (uint64_t pos = chunkStart;
                  pos < scan; ++pos) {
                 if (ReadIndex(outer, pos, inner) == group) {
                     WriteOut(
                         FlatOffset(outer, pos, inner),
-                        work.GetValue(outputPos++));
+                        work.GetValue(outputPos++) * inverse);
                 }
             }
         }
@@ -1441,12 +1654,12 @@ private:
                             outer, chunkStart + i, inner)) -
                     maxValue);
             }
-            ExpAndScaleWork(n, inverse);
+            ExpWorkOnly(n);
             for (uint32_t i = 0; i < n; ++i) {
                 WriteOut(
                     FlatOffset(
                         outer, chunkStart + i, inner),
-                    work.GetValue(i));
+                    work.GetValue(i) * inverse);
             }
             chunkStart += n;
         }
