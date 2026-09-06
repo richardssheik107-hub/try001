@@ -32,7 +32,7 @@ public:
         eps_ = eps;
 
         // Two 32-byte UB buffers are enough for a correctness-first scalar-to-
-        // vector Exp bridge.  The optimized version will batch whole groups.
+        // vector Exp bridge. The optimized version will batch whole groups.
         pipe_.InitBuffer(expInputBuf_, 32);
         pipe_.InitBuffer(expOutputBuf_, 32);
     }
@@ -75,10 +75,20 @@ private:
     __aicore__ inline float ExpScalar(float value) {
         AscendC::LocalTensor<float> in = expInputBuf_.Get<float>();
         AscendC::LocalTensor<float> out = expOutputBuf_.Get<float>();
+
+        // SetValue runs on the scalar pipeline while Exp runs on the vector
+        // pipeline. The competition CANN toolchain does not provide SyncFunc;
+        // use the supported hard-event synchronization primitives instead.
         in.SetValue(0, value);
-        AscendC::SyncFunc<AscendC::HardEvent::S_V>();
+        auto eventSToV = pipe_.FetchEventID(AscendC::HardEvent::S_V);
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(eventSToV);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(eventSToV);
+
         AscendC::Exp(out, in, 1);
-        AscendC::SyncFunc<AscendC::HardEvent::V_S>();
+        auto eventVToS = pipe_.FetchEventID(AscendC::HardEvent::V_S);
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(eventVToS);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(eventVToS);
+
         return out.GetValue(0);
     }
 
