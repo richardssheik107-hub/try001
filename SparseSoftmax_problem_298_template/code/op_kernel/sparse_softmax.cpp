@@ -3,21 +3,37 @@
 #include "sparse_softmax_tiling.h"
 #include "tiling_key_sparse_softmax.h"
 
-template <typename T>
-struct StorageTraits {
-    using StorageType = T;
+template <int DT_MODE>
+struct StorageTraits;
+
+template <>
+struct StorageTraits<SPARSE_SOFTMAX_FP32> {
+    using StorageType = float;
+
+    __aicore__ static inline float ToFloatValue(StorageType value) {
+        return value;
+    }
+
+    __aicore__ static inline StorageType FromFloatValue(float value) {
+        return value;
+    }
+};
+
+template <>
+struct StorageTraits<SPARSE_SOFTMAX_FP16> {
+    using StorageType = half;
 
     __aicore__ static inline float ToFloatValue(StorageType value) {
         return static_cast<float>(value);
     }
 
     __aicore__ static inline StorageType FromFloatValue(float value) {
-        return static_cast<StorageType>(value);
+        return static_cast<half>(value);
     }
 };
 
 template <>
-struct StorageTraits<bfloat16_t> {
+struct StorageTraits<SPARSE_SOFTMAX_BF16> {
     using StorageType = uint16_t;
 
     __aicore__ static inline float ToFloatValue(StorageType value) {
@@ -36,16 +52,17 @@ struct StorageTraits<bfloat16_t> {
         } bits;
         bits.f = value;
 
-        const uint32_t lsb = (bits.u >> 16) & 1U;
+        const uint32_t upper = bits.u >> 16;
+        const uint32_t lsb = upper & 1U;
         const uint32_t rounded = bits.u + 0x7FFFU + lsb;
         return static_cast<uint16_t>(rounded >> 16);
     }
 };
 
-template <typename T>
+template <int DT_MODE>
 class KernelSparseSoftmax {
 public:
-    using StorageType = typename StorageTraits<T>::StorageType;
+    using StorageType = typename StorageTraits<DT_MODE>::StorageType;
 
     __aicore__ inline KernelSparseSoftmax() {}
 
@@ -102,11 +119,11 @@ private:
     }
 
     __aicore__ inline float ReadSrc(uint64_t offset) const {
-        return StorageTraits<T>::ToFloatValue(srcGlobal_.GetValue(offset));
+        return StorageTraits<DT_MODE>::ToFloatValue(srcGlobal_.GetValue(offset));
     }
 
     __aicore__ inline void WriteOut(uint64_t offset, float value) {
-        outGlobal_.SetValue(offset, StorageTraits<T>::FromFloatValue(value));
+        outGlobal_.SetValue(offset, StorageTraits<DT_MODE>::FromFloatValue(value));
     }
 
     __aicore__ inline float ExpScalar(float value) {
@@ -252,14 +269,14 @@ private:
     float eps_ = 1e-16f;
 };
 
-template <typename DT_SRC>
+template <int DT_MODE>
 __global__ __aicore__ void sparse_softmax(GM_ADDR src, GM_ADDR index, GM_ADDR ptr,
                                           GM_ADDR out, GM_ADDR workspace,
                                           GM_ADDR tiling) {
     REGISTER_TILING_DEFAULT(SparseSoftmaxTilingData);
     GET_TILING_DATA_WITH_STRUCT(SparseSoftmaxTilingData, tilingData, tiling);
 
-    KernelSparseSoftmax<DT_SRC> op;
+    KernelSparseSoftmax<DT_MODE> op;
     op.Init(src, index, ptr, out,
             tilingData.totalLength,
             tilingData.outerSize,
