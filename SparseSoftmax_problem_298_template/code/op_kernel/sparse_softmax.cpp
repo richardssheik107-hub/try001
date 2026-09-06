@@ -1742,7 +1742,7 @@ private:
     AscendC::TPipe pipe_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> workBuf_;
     AscendC::TBuf<AscendC::TPosition::VECIN> rawBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECIN> indexBuf_;
+    mutable AscendC::TBuf<AscendC::TPosition::VECIN> indexBuf_;
     AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue_;
 
     AscendC::GlobalTensor<StorageType> srcGlobal_;
