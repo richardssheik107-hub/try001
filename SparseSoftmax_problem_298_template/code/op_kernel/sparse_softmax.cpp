@@ -74,10 +74,10 @@ public:
         srcGlobal_.SetGlobalBuffer((__gm__ StorageType *)src);
         outGlobal_.SetGlobalBuffer((__gm__ StorageType *)out);
         if (index != nullptr) {
-            indexGlobal_.SetGlobalBuffer((__gm__ int64_t *)index);
+            indexGlobal_.SetGlobalBuffer((__gm__ int32_t *)index);
         }
         if (ptr != nullptr) {
-            ptrGlobal_.SetGlobalBuffer((__gm__ int64_t *)ptr);
+            ptrGlobal_.SetGlobalBuffer((__gm__ int32_t *)ptr);
         }
 
         totalLength_ = totalLength;
@@ -103,9 +103,6 @@ public:
             ProcessIndex();
         }
 
-        // GlobalTensor::SetValue writes through the scalar DataCache. Flush the
-        // cache once after all output elements are written so the judge sees
-        // the final values in GM.
         AscendC::DataCacheCleanAndInvalid<StorageType,
             AscendC::CacheLine::ENTIRE_DATA_CACHE,
             AscendC::DcciDst::CACHELINE_OUT>(outGlobal_);
@@ -120,9 +117,9 @@ private:
     __aicore__ inline int64_t ReadIndex(uint64_t outer, uint64_t dim,
                                         uint64_t inner) const {
         if (indexLength_ == totalLength_) {
-            return indexGlobal_.GetValue(FlatOffset(outer, dim, inner));
+            return static_cast<int64_t>(indexGlobal_.GetValue(FlatOffset(outer, dim, inner)));
         }
-        return indexGlobal_.GetValue(dim);
+        return static_cast<int64_t>(indexGlobal_.GetValue(dim));
     }
 
     __aicore__ inline float ReadSrc(uint64_t offset) const {
@@ -210,8 +207,8 @@ private:
         for (uint64_t outer = 0; outer < outerSize_; ++outer) {
             for (uint64_t inner = 0; inner < innerSize_; ++inner) {
                 for (uint64_t group = 0; group < groupCount; ++group) {
-                    int64_t startRaw = ptrGlobal_.GetValue(group);
-                    int64_t endRaw = ptrGlobal_.GetValue(group + 1);
+                    int64_t startRaw = static_cast<int64_t>(ptrGlobal_.GetValue(group));
+                    int64_t endRaw = static_cast<int64_t>(ptrGlobal_.GetValue(group + 1));
 
                     if (startRaw < 0) {
                         startRaw = 0;
@@ -262,8 +259,8 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> expInputBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> expOutputBuf_;
     AscendC::GlobalTensor<StorageType> srcGlobal_;
-    AscendC::GlobalTensor<int64_t> indexGlobal_;
-    AscendC::GlobalTensor<int64_t> ptrGlobal_;
+    AscendC::GlobalTensor<int32_t> indexGlobal_;
+    AscendC::GlobalTensor<int32_t> ptrGlobal_;
     AscendC::GlobalTensor<StorageType> outGlobal_;
 
     uint64_t totalLength_ = 0;
