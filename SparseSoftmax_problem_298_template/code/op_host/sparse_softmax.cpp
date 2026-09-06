@@ -35,7 +35,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
             eps = *attrEps;
         }
     }
-
     if (dim < 0) {
         dim += rank;
     }
@@ -43,8 +42,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         return ge::GRAPH_FAILED;
     }
 
-    const uint64_t totalLength = static_cast<uint64_t>(shape.GetShapeSize());
-    const uint64_t dimSize = static_cast<uint64_t>(shape.GetDim(dim));
+    const uint64_t totalLength =
+        static_cast<uint64_t>(shape.GetShapeSize());
+    const uint64_t dimSize =
+        static_cast<uint64_t>(shape.GetDim(dim));
 
     uint64_t innerSize = 1;
     for (int64_t i = dim + 1; i < rank; ++i) {
@@ -57,10 +58,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     }
 
     const uint64_t indexLength =
-        index == nullptr ? 0 : static_cast<uint64_t>(index->GetShapeSize());
+        index == nullptr ? 0 :
+        static_cast<uint64_t>(index->GetShapeSize());
     const uint64_t ptrLength =
-        ptr == nullptr ? 0 : static_cast<uint64_t>(ptr->GetShapeSize());
+        ptr == nullptr ? 0 :
+        static_cast<uint64_t>(ptr->GetShapeSize());
 
+    // Keep the same precedence as PyG: ptr wins when both are present.
     const uint32_t mode = ptr == nullptr ? 0U : 1U;
     if (mode == 0U && indexLength == 0U && totalLength != 0U) {
         return ge::GRAPH_FAILED;
@@ -85,48 +89,87 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     const uint32_t dtypeSize =
         static_cast<uint32_t>(ge::GetSizeByDataType(dtypeSrc));
 
-    // Generic runtime strategy:
-    //   2: CSR groups are independent and contiguous when innerSize == 1, so
-    //      schedule groups directly across cores and use DMA for every group.
-    //   1: Otherwise, stage a complete outer slab or a 2-D inner tile through
-    //      UB and write it back with DMA.  This covers arbitrary rank/dim.
-    //   0: Only when no safe DMA tile fits do we keep the scalar correctness
-    //      fallback.
-    uint32_t fastPath = 0U;
-    const uint64_t outerSlabElems = dimSize * innerSize;
-    const uint64_t outerSlabBytes = outerSlabElems * dtypeSize;
-    const bool wholeOuterFits =
-        outerSlabBytes <= SPARSE_SOFTMAX_RAW_BUFFER_BYTES;
-    const bool twoDTileFits =
-        dimSize > 0 &&
-        dimSize <= SPARSE_SOFTMAX_MAX_DMA_BLOCKS &&
-        dimSize * 32ULL <= SPARSE_SOFTMAX_RAW_BUFFER_BYTES;
-
-    if (mode == 1U && innerSize == 1U) {
-        fastPath = 2U;
-    } else if (wholeOuterFits || twoDTileFits) {
-        fastPath = 1U;
-    }
-
     auto platform =
         platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    int32_t coreNum = platform.GetCoreNumAiv();
-    if (coreNum <= 0) {
-        coreNum = 1;
+    int32_t availableCore = platform.GetCoreNumAiv();
+    if (availableCore <= 0) {
+        availableCore = 1;
+    }
+    uint32_t coreCap = static_cast<uint32_t>(availableCore);
+    if (coreCap > SPARSE_SOFTMAX_MAX_AIV) {
+        coreCap = SPARSE_SOFTMAX_MAX_AIV;
     }
 
-    uint64_t taskCount = 1;
-    if (fastPath == 2U) {
-        taskCount = outerSize * (ptrLength - 1U);
-    } else if (fastPath == 1U) {
-        taskCount = outerSize;
+    // Maximum 2-D DMA width that fits one padded [dim, tileWidth] tile in UB.
+    uint64_t maxTileWidth = 0;
+    if (dimSize > 0 && dimSize <= SPARSE_SOFTMAX_MAX_DMA_BLOCKS) {
+        uint64_t bytesPerRow =
+            SPARSE_SOFTMAX_RAW_BUFFER_BYTES / dimSize;
+        bytesPerRow = (bytesPerRow / 32ULL) * 32ULL;
+        if (bytesPerRow >= 32ULL) {
+            maxTileWidth = bytesPerRow / dtypeSize;
+            if (maxTileWidth > innerSize) {
+                maxTileWidth = innerSize;
+            }
+        }
     }
+
+    // Strategy is based only on semantic layout/shape:
+    //   3: index along a contiguous axis -> group-owner + aligned MTE3 runs.
+    //   2: CSR along a contiguous axis -> (outer, group) DMA tasks.
+    //   1: arbitrary-rank inner lanes -> independent (outer, inner-tile) DMA.
+    //   0: fully generic scalar fallback.
+    uint32_t fastPath = 0U;
+    uint64_t innerTileWidth = innerSize == 0 ? 1 : innerSize;
+    uint64_t tileCount = 1;
+    uint64_t taskCount = 1;
+
+    if (mode == 0U && innerSize == 1U) {
+        fastPath = 3U;
+        taskCount = outerSize * dimSize;  // first-occurrence seeds
+    } else if (mode == 1U && innerSize == 1U) {
+        fastPath = 2U;
+        taskCount = outerSize * (ptrLength - 1U);
+    } else if (maxTileWidth > 0U && innerSize > 0U) {
+        fastPath = 1U;
+
+        // Create enough independent inner tiles to keep up to 8 AIVs busy,
+        // while never exceeding the UB-safe width.
+        uint64_t desiredTilesPerOuter = 1;
+        if (outerSize > 0 && outerSize < coreCap) {
+            desiredTilesPerOuter =
+                (static_cast<uint64_t>(coreCap) + outerSize - 1U) /
+                outerSize;
+        }
+        uint64_t widthForParallelism =
+            (innerSize + desiredTilesPerOuter - 1U) /
+            desiredTilesPerOuter;
+        if (widthForParallelism == 0) {
+            widthForParallelism = 1;
+        }
+
+        innerTileWidth = std::min<uint64_t>(
+            maxTileWidth, widthForParallelism);
+        if (innerTileWidth == 0) {
+            innerTileWidth = 1;
+        }
+        tileCount =
+            (innerSize + innerTileWidth - 1U) / innerTileWidth;
+        taskCount = outerSize * tileCount;
+    }
+
     if (taskCount == 0) {
         taskCount = 1;
     }
 
-    const uint32_t blockDim = static_cast<uint32_t>(
-        std::min<uint64_t>(static_cast<uint64_t>(coreNum), taskCount));
+    uint32_t blockDim = 1;
+    if (fastPath != 0U) {
+        blockDim = static_cast<uint32_t>(
+            std::min<uint64_t>(coreCap, taskCount));
+        if (blockDim == 0) {
+            blockDim = 1;
+        }
+    }
 
     SparseSoftmaxTilingData *tiling =
         context->GetTilingData<SparseSoftmaxTilingData>();
@@ -140,10 +183,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     tiling->fastPath = fastPath;
     tiling->blockDim = blockDim;
     tiling->dtypeSize = dtypeSize;
+    tiling->innerTileWidth = innerTileWidth;
+    tiling->tileCount = tileCount;
     tiling->eps = eps;
 
     context->SetBlockDim(blockDim);
-
     size_t *workspace = context->GetWorkspaceSizes(1);
     workspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -189,8 +233,11 @@ public:
             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
         this->Attr("dim").AttrType(OPTIONAL).Int(0);
         this->Attr("eps").AttrType(OPTIONAL).Float(1e-16);
-        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc).AddConfig("ascend910b");
+        this->SetInferShape(ge::InferShape)
+            .SetInferDataType(ge::InferDataType);
+        this->AICore()
+            .SetTiling(optiling::TilingFunc)
+            .AddConfig("ascend910b");
     }
 };
 OP_ADD(SparseSoftmax);
