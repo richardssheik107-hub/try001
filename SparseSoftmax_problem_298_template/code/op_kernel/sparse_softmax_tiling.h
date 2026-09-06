@@ -6,7 +6,7 @@
 // the scalar fallback preserves arbitrary supported shapes.
 constexpr uint32_t SPARSE_SOFTMAX_RAW_BUFFER_BYTES = 8192;
 constexpr uint32_t SPARSE_SOFTMAX_INDEX_BUFFER_BYTES = 4096;
-constexpr uint32_t SPARSE_SOFTMAX_WORK_BUFFER_ELEMS = 1024;
+constexpr uint32_t SPARSE_SOFTMAX_WORK_BUFFER_ELEMS = 2048;
 constexpr uint32_t SPARSE_SOFTMAX_AXIS_OUT_QUEUE_BYTES = 4096;
 constexpr uint32_t SPARSE_SOFTMAX_MAX_DMA_BLOCKS = 4095;
 constexpr uint32_t SPARSE_SOFTMAX_MAX_AIV = 8;
