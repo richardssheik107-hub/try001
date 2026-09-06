@@ -64,6 +64,9 @@ class KernelSparseSoftmax {
 public:
     using StorageType = typename StorageTraits<DT_MODE>::StorageType;
 
+    static constexpr uint32_t GROUP_BUFFER_ELEMS = 2048;
+    static constexpr uint32_t INDEX_CACHE_ELEMS = 4096;
+
     __aicore__ inline KernelSparseSoftmax() {}
 
     __aicore__ inline void Init(GM_ADDR src, GM_ADDR index, GM_ADDR ptr, GM_ADDR out,
@@ -89,14 +92,16 @@ public:
         mode_ = mode;
         eps_ = eps;
 
-        pipe_.InitBuffer(expInputBuf_, 32);
-        pipe_.InitBuffer(expOutputBuf_, 32);
+        pipe_.InitBuffer(valueBuf_, GROUP_BUFFER_ELEMS * sizeof(float));
+        pipe_.InitBuffer(expBuf_, GROUP_BUFFER_ELEMS * sizeof(float));
+        pipe_.InitBuffer(indexBuf_, INDEX_CACHE_ELEMS * sizeof(int32_t));
     }
 
     __aicore__ inline void Process() {
         if (totalLength_ == 0 || dimSize_ == 0 || outerSize_ == 0) {
             return;
         }
+
         if (mode_ == 1U) {
             ProcessPtr();
         } else {
@@ -114,12 +119,12 @@ private:
         return (outer * dimSize_ + dim) * innerSize_ + inner;
     }
 
-    __aicore__ inline int64_t ReadIndex(uint64_t outer, uint64_t dim,
+    __aicore__ inline int32_t ReadIndex(uint64_t outer, uint64_t dim,
                                         uint64_t inner) const {
         if (indexLength_ == totalLength_) {
-            return static_cast<int64_t>(indexGlobal_.GetValue(FlatOffset(outer, dim, inner)));
+            return indexGlobal_.GetValue(FlatOffset(outer, dim, inner));
         }
-        return static_cast<int64_t>(indexGlobal_.GetValue(dim));
+        return indexGlobal_.GetValue(dim);
     }
 
     __aicore__ inline float ReadSrc(uint64_t offset) const {
@@ -130,69 +135,322 @@ private:
         outGlobal_.SetValue(offset, StorageTraits<DT_MODE>::FromFloatValue(value));
     }
 
-    __aicore__ inline float ExpScalar(float value) {
-        AscendC::LocalTensor<float> in = expInputBuf_.Get<float>();
-        AscendC::LocalTensor<float> out = expOutputBuf_.Get<float>();
+    __aicore__ inline void ExpBuffered(uint32_t count) {
+        AscendC::LocalTensor<float> values = valueBuf_.Get<float>();
+        AscendC::LocalTensor<float> exps = expBuf_.Get<float>();
 
-        in.SetValue(0, value);
         auto eventSToV = pipe_.FetchEventID(AscendC::HardEvent::S_V);
         AscendC::SetFlag<AscendC::HardEvent::S_V>(eventSToV);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(eventSToV);
 
-        AscendC::Exp(out, in, 1);
+        AscendC::Exp(exps, values, static_cast<int32_t>(count));
+
         auto eventVToS = pipe_.FetchEventID(AscendC::HardEvent::V_S);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(eventVToS);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(eventVToS);
+    }
 
-        return out.GetValue(0);
+    __aicore__ inline void ProcessContiguousGroup(uint64_t outer, uint64_t inner,
+                                                  uint64_t start, uint64_t end) {
+        const uint64_t count64 = end - start;
+        if (count64 == 0) {
+            return;
+        }
+        if (count64 == 1) {
+            WriteOut(FlatOffset(outer, start, inner), 1.0f / (1.0f + eps_));
+            return;
+        }
+
+        if (count64 <= GROUP_BUFFER_ELEMS) {
+            AscendC::LocalTensor<float> values = valueBuf_.Get<float>();
+            AscendC::LocalTensor<float> exps = expBuf_.Get<float>();
+            const uint32_t count = static_cast<uint32_t>(count64);
+
+            float groupMax = -3.402823466e+38F;
+            for (uint32_t i = 0; i < count; ++i) {
+                const float value = ReadSrc(FlatOffset(outer, start + i, inner));
+                values.SetValue(i, value);
+                if (value > groupMax) {
+                    groupMax = value;
+                }
+            }
+
+            for (uint32_t i = 0; i < count; ++i) {
+                values.SetValue(i, values.GetValue(i) - groupMax);
+            }
+
+            ExpBuffered(count);
+
+            float groupSum = 0.0f;
+            for (uint32_t i = 0; i < count; ++i) {
+                groupSum += exps.GetValue(i);
+            }
+            const float invDenom = 1.0f / (groupSum + eps_);
+
+            for (uint32_t i = 0; i < count; ++i) {
+                WriteOut(FlatOffset(outer, start + i, inner), exps.GetValue(i) * invDenom);
+            }
+            return;
+        }
+
+        ProcessContiguousGroupLarge(outer, inner, start, end);
+    }
+
+    __aicore__ inline void ProcessContiguousGroupLarge(uint64_t outer, uint64_t inner,
+                                                       uint64_t start, uint64_t end) {
+        AscendC::LocalTensor<float> values = valueBuf_.Get<float>();
+        AscendC::LocalTensor<float> exps = expBuf_.Get<float>();
+
+        float groupMax = -3.402823466e+38F;
+        for (uint64_t k = start; k < end; ++k) {
+            const float value = ReadSrc(FlatOffset(outer, k, inner));
+            if (value > groupMax) {
+                groupMax = value;
+            }
+        }
+
+        float groupSum = 0.0f;
+        uint64_t chunkStart = start;
+        while (chunkStart < end) {
+            const uint64_t remain = end - chunkStart;
+            const uint32_t count = static_cast<uint32_t>(
+                remain > GROUP_BUFFER_ELEMS ? GROUP_BUFFER_ELEMS : remain);
+
+            for (uint32_t i = 0; i < count; ++i) {
+                values.SetValue(i,
+                    ReadSrc(FlatOffset(outer, chunkStart + i, inner)) - groupMax);
+            }
+            ExpBuffered(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                groupSum += exps.GetValue(i);
+            }
+            chunkStart += count;
+        }
+
+        const float invDenom = 1.0f / (groupSum + eps_);
+        chunkStart = start;
+        while (chunkStart < end) {
+            const uint64_t remain = end - chunkStart;
+            const uint32_t count = static_cast<uint32_t>(
+                remain > GROUP_BUFFER_ELEMS ? GROUP_BUFFER_ELEMS : remain);
+
+            for (uint32_t i = 0; i < count; ++i) {
+                values.SetValue(i,
+                    ReadSrc(FlatOffset(outer, chunkStart + i, inner)) - groupMax);
+            }
+            ExpBuffered(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                WriteOut(FlatOffset(outer, chunkStart + i, inner),
+                         exps.GetValue(i) * invDenom);
+            }
+            chunkStart += count;
+        }
+    }
+
+    __aicore__ inline int32_t IndexValue(const AscendC::LocalTensor<int32_t>& cachedIndex,
+                                         bool useCache,
+                                         uint64_t outer, uint64_t dim,
+                                         uint64_t inner) const {
+        if (useCache) {
+            return cachedIndex.GetValue(static_cast<uint32_t>(dim));
+        }
+        return ReadIndex(outer, dim, inner);
+    }
+
+    __aicore__ inline bool CacheIndexSlice(uint64_t outer, uint64_t inner,
+                                           AscendC::LocalTensor<int32_t>& cachedIndex) {
+        if (dimSize_ > INDEX_CACHE_ELEMS) {
+            return false;
+        }
+        for (uint64_t dim = 0; dim < dimSize_; ++dim) {
+            cachedIndex.SetValue(static_cast<uint32_t>(dim), ReadIndex(outer, dim, inner));
+        }
+        return true;
+    }
+
+    __aicore__ inline bool IsIndexNonDecreasing(
+        const AscendC::LocalTensor<int32_t>& cachedIndex,
+        bool useCache, uint64_t outer, uint64_t inner) const {
+        if (dimSize_ < 2) {
+            return true;
+        }
+
+        int32_t prev = IndexValue(cachedIndex, useCache, outer, 0, inner);
+        for (uint64_t dim = 1; dim < dimSize_; ++dim) {
+            const int32_t current = IndexValue(cachedIndex, useCache, outer, dim, inner);
+            if (current < prev) {
+                return false;
+            }
+            prev = current;
+        }
+        return true;
+    }
+
+    __aicore__ inline void ProcessSortedIndexSlice(
+        uint64_t outer, uint64_t inner,
+        const AscendC::LocalTensor<int32_t>& cachedIndex, bool useCache) {
+        uint64_t runStart = 0;
+        while (runStart < dimSize_) {
+            const int32_t group = IndexValue(cachedIndex, useCache, outer, runStart, inner);
+            uint64_t runEnd = runStart + 1;
+            while (runEnd < dimSize_ &&
+                   IndexValue(cachedIndex, useCache, outer, runEnd, inner) == group) {
+                ++runEnd;
+            }
+            ProcessContiguousGroup(outer, inner, runStart, runEnd);
+            runStart = runEnd;
+        }
+    }
+
+    __aicore__ inline void ProcessIndexGroup(
+        uint64_t outer, uint64_t inner, int32_t group,
+        const AscendC::LocalTensor<int32_t>& cachedIndex, bool useCache) {
+        AscendC::LocalTensor<float> values = valueBuf_.Get<float>();
+        AscendC::LocalTensor<float> exps = expBuf_.Get<float>();
+
+        float groupMax = -3.402823466e+38F;
+        uint64_t groupCount = 0;
+        for (uint64_t k = 0; k < dimSize_; ++k) {
+            if (IndexValue(cachedIndex, useCache, outer, k, inner) != group) {
+                continue;
+            }
+
+            const float value = ReadSrc(FlatOffset(outer, k, inner));
+            if (groupCount < GROUP_BUFFER_ELEMS) {
+                values.SetValue(static_cast<uint32_t>(groupCount), value);
+            }
+            ++groupCount;
+            if (value > groupMax) {
+                groupMax = value;
+            }
+        }
+
+        if (groupCount == 0) {
+            return;
+        }
+        if (groupCount == 1) {
+            for (uint64_t k = 0; k < dimSize_; ++k) {
+                if (IndexValue(cachedIndex, useCache, outer, k, inner) == group) {
+                    WriteOut(FlatOffset(outer, k, inner), 1.0f / (1.0f + eps_));
+                    return;
+                }
+            }
+        }
+
+        if (groupCount <= GROUP_BUFFER_ELEMS) {
+            const uint32_t count = static_cast<uint32_t>(groupCount);
+            for (uint32_t i = 0; i < count; ++i) {
+                values.SetValue(i, values.GetValue(i) - groupMax);
+            }
+            ExpBuffered(count);
+
+            float groupSum = 0.0f;
+            for (uint32_t i = 0; i < count; ++i) {
+                groupSum += exps.GetValue(i);
+            }
+            const float invDenom = 1.0f / (groupSum + eps_);
+
+            uint32_t pos = 0;
+            for (uint64_t k = 0; k < dimSize_; ++k) {
+                if (IndexValue(cachedIndex, useCache, outer, k, inner) != group) {
+                    continue;
+                }
+                WriteOut(FlatOffset(outer, k, inner), exps.GetValue(pos) * invDenom);
+                ++pos;
+            }
+            return;
+        }
+
+        ProcessIndexGroupLarge(outer, inner, group, groupMax, cachedIndex, useCache);
+    }
+
+    __aicore__ inline void ProcessIndexGroupLarge(
+        uint64_t outer, uint64_t inner, int32_t group, float groupMax,
+        const AscendC::LocalTensor<int32_t>& cachedIndex, bool useCache) {
+        AscendC::LocalTensor<float> values = valueBuf_.Get<float>();
+        AscendC::LocalTensor<float> exps = expBuf_.Get<float>();
+
+        float groupSum = 0.0f;
+        uint64_t scan = 0;
+        while (scan < dimSize_) {
+            uint32_t count = 0;
+            while (scan < dimSize_ && count < GROUP_BUFFER_ELEMS) {
+                if (IndexValue(cachedIndex, useCache, outer, scan, inner) == group) {
+                    values.SetValue(count,
+                        ReadSrc(FlatOffset(outer, scan, inner)) - groupMax);
+                    ++count;
+                }
+                ++scan;
+            }
+            if (count == 0) {
+                continue;
+            }
+            ExpBuffered(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                groupSum += exps.GetValue(i);
+            }
+        }
+
+        const float invDenom = 1.0f / (groupSum + eps_);
+        scan = 0;
+        while (scan < dimSize_) {
+            const uint64_t chunkScanStart = scan;
+            uint32_t count = 0;
+            while (scan < dimSize_ && count < GROUP_BUFFER_ELEMS) {
+                if (IndexValue(cachedIndex, useCache, outer, scan, inner) == group) {
+                    values.SetValue(count,
+                        ReadSrc(FlatOffset(outer, scan, inner)) - groupMax);
+                    ++count;
+                }
+                ++scan;
+            }
+            if (count == 0) {
+                continue;
+            }
+
+            ExpBuffered(count);
+            uint32_t pos = 0;
+            for (uint64_t k = chunkScanStart; k < scan; ++k) {
+                if (IndexValue(cachedIndex, useCache, outer, k, inner) != group) {
+                    continue;
+                }
+                WriteOut(FlatOffset(outer, k, inner), exps.GetValue(pos) * invDenom);
+                ++pos;
+            }
+        }
+    }
+
+    __aicore__ inline void ProcessUnsortedIndexSlice(
+        uint64_t outer, uint64_t inner,
+        const AscendC::LocalTensor<int32_t>& cachedIndex, bool useCache) {
+        for (uint64_t dim = 0; dim < dimSize_; ++dim) {
+            const int32_t group = IndexValue(cachedIndex, useCache, outer, dim, inner);
+
+            bool seen = false;
+            for (uint64_t prev = 0; prev < dim; ++prev) {
+                if (IndexValue(cachedIndex, useCache, outer, prev, inner) == group) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) {
+                continue;
+            }
+
+            ProcessIndexGroup(outer, inner, group, cachedIndex, useCache);
+        }
     }
 
     __aicore__ inline void ProcessIndex() {
+        AscendC::LocalTensor<int32_t> cachedIndex = indexBuf_.Get<int32_t>();
+
         for (uint64_t outer = 0; outer < outerSize_; ++outer) {
             for (uint64_t inner = 0; inner < innerSize_; ++inner) {
-                for (uint64_t dim = 0; dim < dimSize_; ++dim) {
-                    const int64_t group = ReadIndex(outer, dim, inner);
-
-                    bool seen = false;
-                    for (uint64_t prev = 0; prev < dim; ++prev) {
-                        if (ReadIndex(outer, prev, inner) == group) {
-                            seen = true;
-                            break;
-                        }
-                    }
-                    if (seen) {
-                        continue;
-                    }
-
-                    float groupMax = -3.402823466e+38F;
-                    for (uint64_t k = 0; k < dimSize_; ++k) {
-                        if (ReadIndex(outer, k, inner) != group) {
-                            continue;
-                        }
-                        const float value = ReadSrc(FlatOffset(outer, k, inner));
-                        if (value > groupMax) {
-                            groupMax = value;
-                        }
-                    }
-
-                    float groupSum = 0.0f;
-                    for (uint64_t k = 0; k < dimSize_; ++k) {
-                        if (ReadIndex(outer, k, inner) != group) {
-                            continue;
-                        }
-                        const float value = ReadSrc(FlatOffset(outer, k, inner));
-                        groupSum += ExpScalar(value - groupMax);
-                    }
-
-                    const float denom = groupSum + eps_;
-                    for (uint64_t k = 0; k < dimSize_; ++k) {
-                        if (ReadIndex(outer, k, inner) != group) {
-                            continue;
-                        }
-                        const uint64_t offset = FlatOffset(outer, k, inner);
-                        const float value = ReadSrc(offset);
-                        WriteOut(offset, ExpScalar(value - groupMax) / denom);
-                    }
+                const bool useCache = CacheIndexSlice(outer, inner, cachedIndex);
+                if (IsIndexNonDecreasing(cachedIndex, useCache, outer, inner)) {
+                    ProcessSortedIndexSlice(outer, inner, cachedIndex, useCache);
+                } else {
+                    ProcessUnsortedIndexSlice(outer, inner, cachedIndex, useCache);
                 }
             }
         }
@@ -226,29 +484,9 @@ private:
                         continue;
                     }
 
-                    const uint64_t start = static_cast<uint64_t>(startRaw);
-                    const uint64_t end = static_cast<uint64_t>(endRaw);
-
-                    float groupMax = -3.402823466e+38F;
-                    for (uint64_t k = start; k < end; ++k) {
-                        const float value = ReadSrc(FlatOffset(outer, k, inner));
-                        if (value > groupMax) {
-                            groupMax = value;
-                        }
-                    }
-
-                    float groupSum = 0.0f;
-                    for (uint64_t k = start; k < end; ++k) {
-                        const float value = ReadSrc(FlatOffset(outer, k, inner));
-                        groupSum += ExpScalar(value - groupMax);
-                    }
-
-                    const float denom = groupSum + eps_;
-                    for (uint64_t k = start; k < end; ++k) {
-                        const uint64_t offset = FlatOffset(outer, k, inner);
-                        const float value = ReadSrc(offset);
-                        WriteOut(offset, ExpScalar(value - groupMax) / denom);
-                    }
+                    ProcessContiguousGroup(outer, inner,
+                        static_cast<uint64_t>(startRaw),
+                        static_cast<uint64_t>(endRaw));
                 }
             }
         }
@@ -256,8 +494,9 @@ private:
 
 private:
     AscendC::TPipe pipe_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> expInputBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> expOutputBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> valueBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> expBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> indexBuf_;
     AscendC::GlobalTensor<StorageType> srcGlobal_;
     AscendC::GlobalTensor<int32_t> indexGlobal_;
     AscendC::GlobalTensor<int32_t> ptrGlobal_;
